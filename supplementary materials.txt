@@ -1,0 +1,470 @@
+#Supplementary Materials
+
+#The R code below includes four functions. The first three are internal functions that are used in the main function. The code is an example for calculating the CI for CFI. 
+
+################################################
+#        internal 1. bootstrap function        #     
+################################################
+#This function is an adapted version of bootstrapLavaan(), and conducts the bootstrap procedures. In bootstrapLavaan(), input requires the value of RMSEA and then a is calculated from RMSEA. For our algorithm, the value of a is searched in the main function, which is the last function in this document. In the function below, a is used in input directly.
+
+boot.lavaan <- function(object,
+                        R  = 1000L, 
+                        verbose = FALSE,                    
+                        warn  = -1L,
+                        parallel = c("no", "multicore", "snow"),
+                        ncpus = 1L,
+                        cl = NULL,
+                #instead of RMSEA, we input "a" here
+                        a = NULL,
+                        fit.measures = c("fmin","cfi","gfi","srmr"),...) 
+{
+  lavdata  <- object@Data
+  lavmodel  <- object@Model
+  lavsamplestats <- object@SampleStats
+  lavoptions <- object@Options
+  lavpartable  <- object@ParTable
+  t0 <- fitMeasures(object, fit.measures)
+  t.star <- matrix(as.numeric(NA), R, length(t0))
+  colnames(t.star) <- names(t0)
+  
+  # prepare
+  old_options <- options(); options(warn = warn)
+  if (missing(parallel)) parallel <- "no"
+  # the next 10 lines are borrowed from the boot package
+  parallel <- match.arg(parallel)
+  have_mc <- have_snow <- FALSE
+  ncpus <- ncpus
+  if (parallel != "no" && ncpus > 1L) 
+  {
+    if (parallel == "multicore") have_mc <- .Platform$OS.type != "windows"
+    else if (parallel == "snow") have_snow <- TRUE
+    if (!have_mc && !have_snow) ncpus <- 1L
+  }
+  
+  Sigma.hat <- lavaan:::computeSigmaHat(lavmodel = lavmodel)
+  Mu.hat <- lavaan:::computeMuHat(lavmodel = lavmodel)
+  
+  if(lavoptions$missing != "listwise")
+    stop("lavaan ERROR: bollen.stine/yuan bootstrap not available for missing data")
+  dataX <- vector("list", length=lavdata@ngroups)
+  
+  dataeXo <- lavdata@eXo
+  
+  # Now use g.a within each group
+  for(g in 1:lavsamplestats@ngroups) 
+  {
+    S <- lavsamplestats@cov[[g]]
+    # test is in Fit slot
+    ghat <- object@test[[1]]$stat.group[[g]]
+    df <- object@test[[1]]$df
+    Sigmahat <- Sigma.hat[[g]]
+    
+    nmv <- nrow(Sigmahat)
+    n <- lavdata@nobs[[g]]
+    
+    S.a <- a*S + (1-a)*Sigmahat
+    
+    # Transform the data (p. 263)
+    S.a.sqrt <- lav_matrix_symmetric_sqrt(S.a)
+    S.inv.sqrt <- lav_matrix_symmetric_sqrt(lavsamplestats@icov[[g]])
+    
+    X <- lavdata@X[[g]]
+    X <- X %*% S.inv.sqrt %*% S.a.sqrt            
+    
+    # transformed data
+    dataX[[g]] <- X
+  }
+  
+  # # run bootstraps
+  boot.sampstats <- function(b) 
+  {
+    # take a bootstrap sample for each group
+    for(g in 1:lavsamplestats@ngroups) 
+    {
+      stopifnot(lavsamplestats@nobs[[g]] > 1L)
+      boot.idx <- sample(x=lavsamplestats@nobs[[g]],
+                         size=lavsamplestats@nobs[[g]], replace=TRUE)
+      dataX[[g]] <- dataX[[g]][boot.idx,,drop=FALSE]
+      if(!is.null(dataeXo[[g]]))
+        dataeXo[[g]] <- dataeXo[[g]][boot.idx,,drop=FALSE]
+    }
+    
+    # verbose
+    if(verbose) cat("  ... bootstrap draw number:", sprintf("%4d", b))
+    
+    bootSampleStats <- try(lavaan:::lav_samplestats_from_data(
+      lavdata       = NULL,
+      DataX         = dataX,
+      DataeXo       = dataeXo,
+      DataOv        = lavdata@ov,
+      DataOvnames   = lavdata@ov.names,
+      DataOvnamesx  = lavdata@ov.names.x,
+      missing       = lavoptions$missing,
+      rescale       = (lavoptions$estimator == "ML" &&
+                         lavoptions$likelihood == "normal"),
+      estimator     = lavoptions$estimator,
+      mimic         = lavoptions$mimic,
+      meanstructure = lavoptions$meanstructure,
+      group.w.free  = lavoptions$group.w.free,
+      missing.h1    = TRUE,
+      verbose       = FALSE), silent=TRUE) 
+    if(inherits(bootSampleStats, "try-error")) 
+    {
+      if(verbose) cat("     FAILED: creating sample statistics\n")
+      options(old_options)
+      return(NULL)        
+    }
+    bootSampleStats
+  }
+  
+  bootsampstats<-lapply(1:R,FUN=boot.sampstats)
+  
+  fn<-function(b)
+  {require(lavaan)
+    bootSampleStats<-bootsampstats[[b]] 
+    # just in case we need the new X in the data slot (lm!)
+    lavdata@X <- dataX
+    
+    if(lavmodel@fixed.x && length(vnames(lavpartable, "ov.x")) > 0L) 
+    {
+      model.boot <- NULL
+    } else {
+      model.boot <- lavmodel
+    }
+    
+    # fit model on bootstrap sample
+    fit.boot <- lavaan(slotOptions     = lavoptions,
+                       slotParTable    = lavpartable,
+                       slotModel       = model.boot,
+                       slotSampleStats = bootSampleStats,
+                       slotData        = lavdata)
+    if(!fit.boot@Fit@converged) 
+    {
+      if(verbose) cat("     FAILED: no convergence\n")
+      options(old_options)
+      return(NULL)
+    }
+    # extract information we need
+    out <- try(fitMeasures(fit.boot, fit.measures), silent=TRUE)
+    
+    if(fit.measures=="cfi")
+    {
+      chisq.fit <- try(fitMeasures(fit.boot, "chisq")[[1]], silent=TRUE)
+      df.fit <- try(fitMeasures(fit.boot, "df")[[1]], silent=TRUE)
+      chisq.b <- try(fitMeasures(fit.boot, "baseline.chisq")[[1]], silent=TRUE)
+      df.b <- try(fitMeasures(fit.boot)["baseline.df"], silent=TRUE)
+      out<-(chisq.fit-df.fit)/(chisq.b-df.b)
+    }
+    
+    if(inherits(out, "try-error")) 
+    {
+      if(verbose) cat("     FAILED: applying FUN to fit.boot\n")
+      options(old_options)
+      return(NULL)
+    } 
+    if(verbose) cat("   OK -- niter = ", 
+                    sprintf("%3d", fit.boot@Fit@iterations), " fx = ",
+                    sprintf("%13.9f", fit.boot@Fit@fx), "\n")
+    out
+  }
+  
+  # this is from the boot function in package boot
+  RR <- R
+  res <- if (ncpus > 1L && (have_mc || have_snow)) 
+  {
+    if (have_mc) 
+    {
+      parallel::mclapply(seq_len(RR), fn, mc.cores = ncpus)
+    } else if (have_snow) {
+      list(...) # evaluate any promises
+      if (is.null(cl)) 
+      {
+        cl <- parallel::makePSOCKcluster(rep("localhost", ncpus))
+        if(RNGkind()[1L] == "L'Ecuyer-CMRG")
+          parallel::clusterSetRNGStream(cl)
+        res <- parallel::parLapply(cl, seq_len(RR), fn)
+        parallel::stopCluster(cl)
+        res
+      } else parallel::parLapply(cl, seq_len(RR), fn)
+    }
+  } else lapply(seq_len(RR), fn)
+  
+  # handle errors and fill in container
+  error.idx <- integer(0)
+  for(b in seq_len(RR))
+  {
+    if(!is.null(res[[b]]) && length(res[[b]]) > 0L)
+    {
+      t.star[b, ] <- res[[b]]
+    } else {
+      error.idx <- c(error.idx, b)
+    }
+  }
+  # handle errors
+  if(length(error.idx) > 0L) 
+  {
+    warning("lavaan WARNING: only ", (R-length(error.idx)), " bootstrap draws were successful")
+    t.star <- t.star[-error.idx,,drop=FALSE]
+    attr(t.star, "error.idx") <- error.idx
+  } else {
+    if(verbose) cat("Number of successful bootstrap draws:",
+                    (R - length(error.idx)), "\n")
+  }
+  # restore options
+  options(old_options)
+  t.star
+}
+
+#########################################################
+#       internal 2. obtain quantile of fit index        #     
+#########################################################
+# The input includes the value of a (“a”), model fit (“fit”) generated from function cfa(), the number of bootstrap draws (“B”), the fitted value of F (“fi”). The function uses the bootstrap function to generate B bootstrap samples and obtains the values of fit index from each bootstrap sample. These values serve as the bootstrap sampling distribution. At the end, the function returns the difference between the quantiles of the fit index from B bootstrap samples and the fitted value of the fit index.
+
+FIquantile<-function(a,fit,B,alpha,fi,ncpu,myseed)
+{
+  set.seed(myseed)
+  boot <- try(boot.lavaan(fit, R = B, parallel = "snow", ncpus=ncpu,
+                          a=a,fit.measures = "cfi"),silent=TRUE)
+  if(class(boot)=="try-error") 
+        {nboot<<-length(boot);return(rep(NA_integer_,length(alpha)))}
+  FIquantile<-quantile(boot,alpha,type=5)
+  #cat("a=", a, "  number of converged bootstrap samples", sprintf("%4d", length(boot)),"\n")
+  nboot<<-length(boot);return(FIquantile-fi)
+}
+nboot<-0
+
+####################################
+#      internal 3. Uniroot         #
+####################################
+#This function searches for the value of a, adapted from uniroot(). Because we are only interested in the root, the part for calculating the function value (f.root) for the root is removed. This change will make the process of searching a much faster, as calculating f.root requires conducting bootstrap. 
+
+uniroot_only<-function (f,  ..., lower, upper, f.lower = f(lower, ...), f.upper = f(upper, ...), extendInt = c("no", "yes", "downX", "upX"), tol = .Machine$double.eps^0.25, maxiter = 1000L) 
+{
+  if (!is.numeric(lower) || !is.numeric(upper) || lower >= upper) stop("lower < upper  is not fulfilled")
+  if (is.na(f.lower) || is.na(f.upper)) stop("f.lower = f(lower) or f.upper = f(upper) is NA")
+  
+  Sig <- switch(match.arg(extendInt), yes = NULL, downX = -1, no = 0, upX = 1, stop("invalid 'extendInt'"))
+  truncate <- function(x) pmax.int(pmin(x, .Machine$double.xmax), -.Machine$double.xmax)
+  f.low. <- truncate(f.lower)
+  f.upp. <- truncate(f.upper)
+  doX <- (is.null(Sig) && f.low. * f.upp. > 0 || is.numeric(Sig) && (Sig * f.low. > 0 || Sig * f.upp. < 0))
+  if (doX) 
+  {
+    Delta <- function(u) 0.01 * pmax(1e-04, abs(u))
+    it <- 0L
+    if (is.null(Sig)) {
+      delta <- Delta(c(lower, upper))
+      while (isTRUE(f.lower * f.upper > 0) && any(iF <- is.finite(c(lower, upper)))) 
+      {
+        if ((it <- it + 1L) > maxiter) stop(gettextf("no sign change found in %d iterations", it - 1), domain = NA)
+        if (iF[1]) 
+        {
+          ol <- lower
+          of <- f.lower
+          if (is.na(f.lower <- f(lower <- lower - delta[1], ...))) 
+          {
+            lower <- ol
+            f.lower <- of
+            delta[1] <- delta[1]/4
+          }
+        }
+        if (iF[2]) 
+        {
+          ol <- upper
+          of <- f.upper
+          if (is.na(f.upper <- f(upper <- upper + delta[2], ...))) 
+          {
+            upper <- ol
+            f.upper <- of
+            delta[2] <- delta[2]/4
+          }
+        }
+        delta <- 2 * delta
+      }
+    }else 
+    {
+      delta <- Delta(lower)
+      while (isTRUE(Sig * f.lower > 0)) 
+      {
+        if ((it <- it + 1L) > maxiter)  stop(gettextf("no sign change found in %d iterations", it - 1), domain = NA)
+        f.lower <- f(lower <- lower - delta, ...)
+        delta <- 2 * delta
+      }
+      delta <- Delta(upper)
+      while (isTRUE(Sig * f.upper < 0)) 
+      {
+        if ((it <- it + 1L) > maxiter)  stop(gettextf("no sign change found in %d iterations", it - 1), domain = NA)
+        f.upper <- f(upper <- upper + delta, ...)
+        delta <- 2 * delta
+      }
+    }
+  }
+  if (!isTRUE(as.vector(sign(f.lower) * sign(f.upper) <= 0))) 
+    stop(if (doX) "did not succeed extending the interval endpoints for f(lower) * f(upper) <= 0"
+         else "f() values at end points not of opposite sign")
+  val <- .External2(stats:::C_zeroin2, function(arg) f(arg, ...),lower, upper, f.lower, f.upper, tol, as.integer(maxiter))
+  iter <- as.integer(val[2L])
+  if (iter < 0) 
+  {
+    warning(sprintf(ngettext(maxiter, "_NOT_ converged in %d iteration",
+                             "_NOT_ converged in %d iterations"), maxiter), domain = NA)
+    iter <- maxiter
+  }
+  if (doX) iter <- iter + it  else it <- NA_integer_
+  list(root = val[1L], iter = iter, init.it = it, estim.prec = val[3L])
+}
+
+
+##############################
+#         main function      #        
+##############################
+
+#This function uses the three functions above, follows the algorithm explained in the paper, first obtains the CI of a, then transform the CI of a to the CI of the fit index. The input includes original dataset (“x”), number of bootstrap samples (“B”), and the alpha level (“alpha”), etc. This function first fit the original dataset to the model, then set the searching bounds of a using some special values of a (calculated from the normal theory CI and the bias-adjusted value of F). Zhang and Savalei’s CI is obtained by taking the quantiles of the bootstrap sampling distribution. The “uniroot” function is used to look for the roots of function FIqunatile() that satisfy the relationship between the fitted value of F and the quantile of the bootstrap sampling distribution (see step 5-6 in Methods part of the paper). The roots are the upper and lower limits of the CI for a. At the end, we transform the CI for a to the CI for CFI.
+
+fitindex.ci.main<-function(x,B,alpha,ncpu,myseed=NULL)    
+{
+  if (missing(myseed)) myseed<-ceiling(runif(1, 0, 626)) ###set a default seed
+  p=ncol(x)
+  n=nrow(x)
+  xname <- paste("x", 1:p, sep="")
+  colnames(x) <-xname
+  
+  S<-cov(x)
+  
+  # fit the parent population
+  datax<-as.data.frame(x)
+  mfit <- try(cfa(model,data = datax,std.lv=TRUE,likelihood = "wishart",estimator="ML"),silent=TRUE)
+  if(class(mfit)=="try-error"||mfit@Fit@converged==FALSE) 
+  {return(output<-c("lower bound"=NA,"upper bound"=NA,"nboot1"=NA,"nboot2"=NA,
+                    "Zhang's lower"=NA,"Zhang's upper"=NA,"fit"=NA,
+                    "a.ci.lower"=NA,"a.ci.upper"=NA,
+                    "al"=NA,"a.yhy"=NA,"au"=NA,"seed"=NA))}
+  Sigma<-fitted(mfit)$cov
+  fi<-fitMeasures(mfit, "fmin")[[1]]
+  Fx<-2*fi
+  Tstat<-fitMeasures(mfit, "chisq")[[1]]
+  df<-fitMeasures(mfit, "df")[[1]]
+  rl<-fitMeasures(mfit, "rmsea.ci.lower")[[1]]
+  ru<-fitMeasures(mfit, "rmsea.ci.upper")[[1]]
+  fl<-rl^2*df
+  fu<-ru^2*df
+  
+  #decomposition and obtain d(eigen values)
+  EL<-t(chol(Sigma))
+  ELs<-forwardsolve(EL,diag(p))
+  ESE<-ELs%*%S%*%t(ELs)
+  ESE<-eigen(ESE,symmetric=TRUE)
+  d<-ESE$values
+  
+  F0=max(Fx-df/(n-1),0)
+  
+  search.a<-function(F0,d,p)
+  {
+    if (F0==0) {a0=0;return(a0)}
+    max.a<- 1/(1-min(d))-1e-3;
+    a0<-min(sqrt(2*F0/sum((d-1)^2)),max.a) ### starting value Yuan page 272
+    
+    for (i in 1:50) 
+    {
+      dia<-a0*d+(1-a0)
+      g1<- -sum(log(dia))+sum(dia)-p ### Yuan page 280
+      dif <- g1 - F0
+      if(abs(dif)< 1e-6){return(a0)} ### exit function here if successful
+      g2 <- a0*sum((d-1)^2/dia) ### Yuan page 280
+      a0 <- min(max(a0 - dif/g2,0),max.a)
+    }
+    return(a0) ## exit function here if search fails to converge in 50 iterations.
+  }
+  
+  a_yhy<-search.a(F0,d,p)
+  al<-search.a(fl,d,p)
+  au<-search.a(fu,d,p)
+  
+  
+  #determin bounds, uniroot
+  fu.quantile<- FIquantile(au,mfit,B,c(alpha,1-alpha),fi,ncpu,myseed)
+  
+  if (au == 0) 
+  {
+    f0.quantile<-fl.quantile<-ZhangCI.minusfi<-fu.quantile
+  } else if (a_yhy ==0) 
+  {
+    ZhangCI.minusfi<-FIquantile(a_yhy,mfit,B,c(alpha,1-alpha),fi,ncpu,myseed)
+    f0.quantile<-fl.quantile<-ZhangCI.minusfi
+  } else if (al == 0)
+  {
+    ZhangCI.minusfi<-FIquantile(a_yhy,mfit,B,c(alpha,1-alpha),fi,ncpu,myseed)
+    fl.quantile<- FIquantile(al,mfit,B,c(alpha,1-alpha),fi,ncpu,myseed)
+    f0.quantile<-fl.quantile
+  } else {
+    ZhangCI.minusfi<-FIquantile(a_yhy,mfit,B,c(alpha,1-alpha),fi,ncpu,myseed)
+    fl.quantile<- FIquantile(al,mfit,B,c(alpha,1-alpha),fi,ncpu,myseed)
+    f0.quantile<-FIquantile(0,mfit,B,c(alpha,1-alpha),fi,ncpu,myseed)
+  }
+  
+  ZhangCI<-ZhangCI.minusfi+fi
+  
+  #lower bound
+  if (!is.na(f0.quantile[[2]]) && f0.quantile[[2]]>0) 
+  {
+    a.lower=0
+  } else if (!is.na(fl.quantile[[2]]) && fl.quantile[[2]]>0) 
+    {
+      a.lower<-try(uniroot_only(FIquantile,lower=0,upper=al,f.lower=f0.quantile[[2]],f.upper=fl.quantile[[2]],tol=max(al/100,.Machine$double.eps^0.25),
+                            fit=mfit,B=B,alpha=1-alpha,fi=fi,ncpu=ncpu,myseed=myseed)$root,silent=TRUE)
+    } else{
+      a.lower<-try(uniroot_only(FIquantile,lower=al,upper=a_yhy,f.lower=fl.quantile[[2]],f.upper=ZhangCI.minusfi[[2]],tol=max(al/100,.Machine$double.eps^0.25),
+                            fit=mfit,B=B,alpha=1-alpha,fi=fi,ncpu=ncpu,myseed=myseed)$root,silent=TRUE)
+    }
+ 
+  if(class(a.lower)=="try-error") {a.lower<-NA}
+  nboot1=nboot
+  
+  #upper bound
+  if (!is.na(f0.quantile[[1]]) && f0.quantile[[1]]>0)
+  {
+  a.upper=0  
+  } else if (!is.na(fu.quantile[[1]]) && fu.quantile[[1]]>0) 
+  {
+    a.upper<-try(uniroot_only(FIquantile,lower=a_yhy,upper=au,f.lower=ZhangCI.minusfi[[1]],f.upper=fu.quantile[[1]],tol=max(au/100,.Machine$double.eps^0.25),
+                          extendInt = c("upX"),fit=mfit,B=B,alpha=alpha,fi=fi,ncpu=ncpu,myseed=myseed)$root,silent=TRUE)
+  } else{
+    a.upper<-try(uniroot_only(FIquantile,lower=au,upper=2*au-a_yhy,f.lower=fu.quantile[[1]],tol=max(au/100,.Machine$double.eps^0.25),
+                          extendInt = c("upX"),fit=mfit,B=B,alpha=alpha,fi=fi,ncpu=ncpu,myseed=myseed)$root,silent=TRUE)
+  }
+  if(class(a.upper)=="try-error") {a.upper<-NA}
+  nboot2=nboot
+  
+  #compute CI using a.lower and a.upper
+  Sal=a.lower*S+(1-a.lower)*Sigma
+  fitl <- try(cfa(model,sample.cov = Sal,sample.nobs = n,std.lv=TRUE,likelihood = "wishart",estimator="ML"),silent=TRUE)
+  if(class(fitl)=="try-error"||fitl@Fit@converged==FALSE) 
+  {fil<-NA} else { 
+    fil<-2*fitMeasures(fitl, "fmin")[[1]]
+  }
+  
+  #compute CI using a.lower and a.upper
+  Sal=a.lower*S+(1-a.lower)*Sigma
+  ESl<-solve(Sigma,Sal)
+  Fl<--log(det(ESl))+sum(diag(ESl))-p
+  Fl.b<--log(det(Sal))+sum(diag(Sal))-p
+  fiu<-1-Fl/Fl.b
+  
+  Sau=a.upper*S+(1-a.upper)*Sigma
+  ESu<-solve(Sigma,Sau)
+  Fu<--log(det(ESu))+sum(diag(ESu))-p
+  Fu.b<--log(det(Sau))+sum(diag(Sau))-p
+  fil<-1-Fu/Fu.b
+
+  ZhangCI<-1-ZhangCI
+  ZhangCI.low<-ZhangCI[[2]]
+  ZhangCI.up<-ZhangCI[[1]]
+
+  output<-c("lower bound"=fil,"upper bound"=fiu,"nboot1"=nboot1,"nboot2"=nboot2,
+            "Zhang's lower"=ZhangCI.low,"Zhang's upper"=ZhangCI.up,"fit"=mfit,
+            "a.ci.lower"=a.lower,"a.ci.upper"=a.upper,
+            "al"=al,"a.yhy"=a_yhy,"au"=au,"seed"=myseed)
+  output
+}
+
+
